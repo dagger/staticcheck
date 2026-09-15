@@ -1,0 +1,226 @@
+"""
+Staticcheck linting for Go projects, with workspace module discovery.
+
+https://staticcheck.dev
+"""
+type Staticcheck {
+  """
+  Staticcheck release installed with go install.
+  """
+  pub version: String! = "v0.8.1"
+
+  """
+  Go version used by the default base. Null when a custom base is set.
+  """
+  pub goVersion: String
+
+  """
+  Go container used to build and run Staticcheck and the source helper.
+  """
+  pub base: Container!
+
+  """
+  Extra workspace-root include patterns mounted for each module.
+  """
+  pub includeExtraFiles: [String!]! = []
+
+  """
+  Module roots to lint. A bare path selects that module and its descendants;
+  "!" excludes, and exclusions always win. "*" and "**" select all modules.
+  With no positive patterns, all modules are selected. Other glob forms are
+  not interpreted. For example ["**", "!docs"] or ["services/**"].
+  """
+  pub lint: [String!]! = ["**"]
+
+  new(
+    version: String! = "v0.8.1",
+    goVersion: String = null,
+    """
+    Custom container with Go and any required C/C++ dependencies installed.
+    Mutually exclusive with goVersion. Staticcheck is built in this container.
+    """
+    base: Container = null,
+    includeExtraFiles: [String!]! = [],
+    lint: [String!]! = ["**"],
+  ) {
+    if (goVersion != null and base != null) {
+      raise "goVersion and base are mutually exclusive"
+    }
+    self.version = version
+    self.goVersion = if (base == null) { goVersion ?? "1.26" } else { null }
+    self.base = base ?? container
+      .from("golang:" + (goVersion ?? "1.26") + "-alpine")
+      .withExec(["apk", "add", "--no-cache", "build-base"])
+    self.includeExtraFiles = includeExtraFiles
+    # Older beta engines pass TOML string arrays as JSON fragments.
+    self.lint = lint.map { p =>
+      p.trimPrefix("[").trimSuffix("]").trimPrefix("\"").trimSuffix("\"")
+    }
+    self
+  }
+
+  """
+  Discover go.mod files at or below the working directory, including the
+  enclosing module when the working directory is inside one.
+  Returned paths are relative to the workspace root.
+  """
+  pub modules(ws: Workspace!, includeSkipped: Boolean! = true): [GoModule!]! {
+    ws
+      .findRoots(markers: ["go.mod"])
+      .map { root =>
+        let segments = root.split("/").filter { s => s != "" and s != "." }
+        let up = segments.filter { s => s == ".." }.length
+        let down = segments.filter { s => s != ".." }
+        let resolved = ws.cwd.split("/").filter { s => s != "" }.dropLast(up) + down
+        module(ws, if (resolved.length == 0) { "." } else { resolved.join("/") }, findUp: false)
+      }
+      .filter { mod => includeSkipped or mod.skipLint == false }
+  }
+
+  """
+  Find the Go module containing a workspace-root-relative directory.
+  Set findUp to false when path is already a module root.
+  """
+  pub module(ws: Workspace!, path: String!, findUp: Boolean! = true): GoModule! {
+    let modPath = if (findUp) {
+      let found = ws.findUp("go.mod", path)
+      if (found == null) {
+        raise "no Go module found containing path: " + path
+      } else {
+        let file = found.trimPrefix("/")
+        if (file == "go.mod") { "." } else { file.trimSuffix("/go.mod") }
+      }
+    } else {
+      let trimmed = path.trimPrefix("/").trimSuffix("/")
+      if (trimmed == "") { "." } else { trimmed }
+    }
+    GoModule(
+      path: modPath,
+      version: version,
+      goVersion: goVersion,
+      baseImage: base,
+      includeExtraFiles: includeExtraFiles,
+      lintPatterns: lint,
+    )
+  }
+
+  """
+  Run Staticcheck in every selected Go module.
+  """
+  pub lintAll(ws: Workspace!): Void @check {
+    let layers = modules(ws, includeSkipped: false).reduce(directory) { layers, mod =>
+      layers.withDirectory(
+        mod.path,
+        directory.withFile("go.mod", mod.lintExec(ws).file("go.mod")),
+      )
+    }
+    # Merging one output from each container forces all lint commands to run
+    # in parallel until Dagger supports directly awaiting multiple containers.
+    layers.sync
+    null
+  }
+}
+
+"""
+A Go module checked with Staticcheck.
+"""
+type GoModule {
+  """
+  Module root relative to the workspace root.
+  """
+  pub path: String!
+  pub version: String!
+  pub goVersion: String
+  pub includeExtraFiles: [String!]!
+  let baseImage: Container!
+  let lintPatterns: [String!]!
+
+  """
+  Whether this module is outside the configured lint selection.
+  """
+  pub skipLint: Boolean! {
+    let included = lintPatterns.filter { p => p.hasPrefix("!") == false }
+    let excluded = lintPatterns.filter { p => p.hasPrefix("!") }.map { p => p.trimPrefix("!") }
+    let isIncluded = included.length == 0 or included.any { p => matchesModulePath(p) }
+    let isExcluded = excluded.any { p => matchesModulePath(p) }
+    isIncluded == false or isExcluded
+  }
+
+  let matchesModulePath(pattern: String!): Boolean! {
+    let p = pattern.trimPrefix("/").trimSuffix("/")
+    if (p == "**" or p == "*") {
+      true
+    } else {
+      let prefix = p.trimSuffix("/**")
+      path == prefix or path.hasPrefix(prefix + "/")
+    }
+  }
+
+  """
+  Go container with shared module and build caches, before mounting sources.
+  """
+  pub base: Container! {
+    baseImage
+      .withoutEntrypoint
+      .withWorkdir("/ws")
+      .withMountedCache("/go/pkg/mod", cacheVolume("go-mod"))
+      .withEnvVariable("GOMODCACHE", "/go/pkg/mod")
+      .withMountedCache("/root/.cache/go-build", cacheVolume("go-build"))
+      .withEnvVariable("GOCACHE", "/root/.cache/go-build")
+  }
+
+  """
+  Go sources, embedded assets, and local replace dependencies for this module.
+  """
+  pub includeDiscovered(ws: Workspace!): [String!]! {
+    # Every module shares the same content-addressed scan of the workspace.
+    let helper = base
+      .withDirectory("/helpers/go-includes", currentModule.source.directory("helpers/go-includes"))
+      .withWorkdir("/helpers/go-includes")
+      .withExec(["go", "build", "-o", "/usr/local/bin/go-includes", "."])
+      .withDirectory("/ws", ws.directory("/", include: ["**/*.go", "**/go.mod"]))
+      .withWorkdir("/ws")
+      .withExec(["go-includes", "--output-dir", "/output"])
+    let stem = if (path == ".") { "_root_" } else { path }
+    helper
+      .file("/output/" + stem + ".inc")
+      .contents
+      .split("\n")
+      .filter { pattern => pattern != "" }
+  }
+
+  """
+  Final workspace include patterns, including inherited Staticcheck config.
+  """
+  pub include(ws: Workspace!): [String!]! {
+    includeDiscovered(ws) + includeExtraFiles + ["**/staticcheck.conf"]
+  }
+
+  """
+  Workspace-shaped source directory mounted for Staticcheck.
+  """
+  pub source(ws: Workspace!): Directory! {
+    ws.directory("/", include: include(ws))
+  }
+
+  """
+  Run Staticcheck on this module and its tests, unless excluded by lint.
+  """
+  pub lint(ws: Workspace!): Void @check {
+    if (skipLint == false) {
+      lintExec(ws).sync
+    }
+    null
+  }
+
+  let lintExec(ws: Workspace!): Container! {
+    base
+      .withEnvVariable("GOBIN", "/usr/local/bin")
+      .withExec(["go", "install", "honnef.co/go/tools/cmd/staticcheck@" + version])
+      .withMountedCache("/root/.cache/staticcheck", cacheVolume("staticcheck"))
+      .withEnvVariable("STATICCHECK_CACHE", "/root/.cache/staticcheck")
+      .withDirectory(".", source(ws))
+      .withWorkdir(path)
+      .withExec(["staticcheck", "./..."])
+  }
+}

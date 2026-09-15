@@ -1,0 +1,117 @@
+"""
+End-to-end checks for the standalone Staticcheck module.
+"""
+type E2e {
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) { raise message }
+    null
+  }
+
+  pub discoveryCheck(ws: Workspace!): Void @check {
+    let tool = staticcheck()
+    let paths = tool.modules(ws).{{path}}
+    assert(paths.any { m => m.path == "testdata/clean" }, "missing clean module")
+    assert(paths.any { m => m.path == "testdata/clean/nested" }, "missing nested module")
+    assert(paths.any { m => m.path == "." } == false, "invented a root module")
+    let below = tool.modules(ws.withWorkdir("testdata/clean")).{{path}}
+    assert(below.length == 2, "discovery from a module root escaped its subtree")
+    let inside = ws.withWorkdir("testdata/clean/assets")
+    assert(
+      tool.modules(inside).{{path}}.any { m => m.path == "testdata/clean" },
+      "discovery inside a module missed its enclosing root",
+    )
+    tool.lintAll(inside)
+    assert(
+      tool.module(ws, "testdata/clean/assets").path == "testdata/clean",
+      "lookup did not resolve the enclosing module",
+    )
+    let missing = {
+      tool.module(ws, ".").path
+    } rescue { err: Error => err.message }
+    assert(missing.contains("no Go module found"), "missing module did not fail clearly")
+    null
+  }
+
+  pub lintAllCheck(ws: Workspace!): Void @check {
+    staticcheck(lint: [
+      "testdata/clean",
+      "testdata/configured",
+      "testdata/replaced",
+      "testdata/cgo",
+    ]).lintAll(ws)
+  }
+
+  pub lintFailureCheck(ws: Workspace!): Void @check {
+    let failure = {
+      staticcheck().module(ws, "testdata/lint-fail").lint(ws)
+      "unexpected success"
+    } rescue { err: Error => err.message }
+    assert(failure.contains("exit code"), "Staticcheck did not reject the broken source: " + failure)
+    let testFailure = {
+      staticcheck().module(ws, "testdata/test-fail").lint(ws)
+      "unexpected success"
+    } rescue { err: Error => err.message }
+    assert(testFailure.contains("exit code"), "Staticcheck did not analyze test files: " + testFailure)
+    let batchFailure = {
+      staticcheck(lint: ["testdata/clean", "testdata/lint-fail"]).lintAll(ws)
+      "unexpected success"
+    } rescue { err: Error => err.message }
+    assert(batchFailure.contains("exit code"), "lintAll did not propagate a module failure: " + batchFailure)
+    null
+  }
+
+  pub selectionCheck(ws: Workspace!): Void @check {
+    let excluded = staticcheck(lint: ["!testdata/lint-fail", "testdata/**"])
+    assert(excluded.module(ws, "testdata/lint-fail").skipLint, "exclusion did not win")
+    assert(excluded.module(ws, "testdata/clean/nested").skipLint == false, "subtree selector missed nested module")
+    let excludeOnly = staticcheck(lint: ["!testdata/lint-fail", "!testdata/test-fail"])
+    assert(excludeOnly.module(ws, "testdata/clean").skipLint == false, "exclude-only selection excluded clean module")
+    assert(excludeOnly.modules(ws, includeSkipped: false).{{path}}.any { m => m.path == "testdata/lint-fail" } == false, "filtered discovery included excluded module")
+    excluded.module(ws, "testdata/lint-fail").lint(ws)
+    staticcheck(lint: ["!**"]).lintAll(ws)
+    staticcheck(lint: ["[\"!testdata/lint-fail\"", "\"!testdata/test-fail\"]"])
+      .module(ws, "testdata/lint-fail").lint(ws)
+    assert(staticcheck(lint: []).module(ws, "testdata/clean").skipLint == false, "empty selectors did not select all")
+    assert(staticcheck(lint: ["testdata/clean"]).module(ws, "testdata/cleaner", findUp: false).skipLint, "path prefix crossed module boundary")
+    null
+  }
+
+  pub sourceCheck(ws: Workspace!): Void @check {
+    let mod = staticcheck(includeExtraFiles: ["testdata/extra.txt"])
+      .module(ws, "testdata/replaced")
+    let src = mod.source(ws)
+    assert(src.file("testdata/clean/assets/message.txt").contents.contains("Hello"), "replace target lost its embedded file")
+    assert(src.file("testdata/extra.txt").contents.contains("extra"), "extra include was not mounted")
+    assert(src.file("testdata/configured/staticcheck.conf").contents.contains("SA1000"), "inherited Staticcheck config was not mounted")
+    assert(src.glob("testdata/clean/nested/assets/**").length == 0, "nested module embed leaked into parent source")
+    mod.lint(ws)
+    null
+  }
+
+  pub customBaseCheck(ws: Workspace!): Void @check {
+    let base = container.from("golang:1.26-alpine")
+      .withNewFile("/custom-base", "custom base\n")
+      .withEntrypoint(["false"])
+    let tool = staticcheck(base: base)
+    assert(tool.goVersion == null, "custom base incorrectly exposed a Go version")
+    let mod = tool.module(ws, "testdata/clean")
+    assert(mod.base.file("/custom-base").contents.contains("custom base"), "custom base was discarded")
+    mod.lint(ws)
+    let conflict = {
+      staticcheck(goVersion: "1.26", base: base).goVersion ?? "no error"
+    } rescue { err: Error => err.message }
+    assert(conflict.contains("mutually exclusive"), "base and goVersion were both accepted")
+    null
+  }
+
+  pub helperCheck(ws: Workspace!): Void @check {
+    container.from("golang:1.26-alpine")
+      .withMountedCache("/go/pkg/mod", cacheVolume("go-mod"))
+      .withMountedCache("/root/.cache/go-build", cacheVolume("go-build"))
+      .withDirectory("/src", ws.directory("/helpers/go-includes"))
+      .withWorkdir("/src")
+      .withExec(["go", "test", "./..."])
+      .sync
+    null
+  }
+}
